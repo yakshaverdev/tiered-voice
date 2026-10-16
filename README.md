@@ -54,4 +54,5 @@ The first line gives the transcript, the time from the VAD stop to the transcrip
 - On clean synthetic speech, call recall is 46% in English and 54% in Hindi. On raw audio with street noise, it is 41% and 51%. With auto-rickshaw noise, it is 26% and 24%.
 - RNNoise before Whisper raised the word error rate in every noisy profile, by 17% to 58%. It helped a little only on clean English. It did not add wrong local actions.
 - Wrong local actions stay rare, because an unsure command goes to the cloud.
-- The sets are too small to show a 99.5% target for sensitive actions. That needs about 600 clean decisions per language. All voices and all noise are synthetic, so the results say little about real users.
+- The sets are too small to show a 99.5% target for sensitive actions. That needs about 600 clean decisions per language.
+- The voices are synthetic and the noise is static pink noise, so the speech results only check that the pipeline works. They do not predict accuracy for real users, which needs real recordings from the glasses.
