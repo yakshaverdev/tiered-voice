@@ -34,6 +34,10 @@ WHISPER = {"turbo": "mlx-community/whisper-large-v3-turbo", "small": "mlx-commun
 # turn's audio, and the turn ends anyway after MAX_WAIT of silence. fixed: the turn ends at a 400 ms VAD stop.
 VAD_STOP = {"smart": 0.2, "fixed": 0.4}
 MAX_WAIT = 0.6
+PREROLL = 0.5  # seconds of audio kept before each turn: VAD fires about 200 ms into speech
+TRANSCRIPT_WAIT = 5  # seconds a finished turn waits for Whisper's last segment
+NO_SPEECH = 0.6  # Whisper segments at or above this no_speech_prob are dropped
+MUTE_TAIL = 0.3  # seconds the mic stays muted after Buddy stops speaking
 LOGS = Path(__file__).parent / "logs"
 # Whisper's prompt: the contact names, so it spells them (heard as "Colpria" without it). Names only:
 # Whisper can repeat its prompt on noise, and a hallucinated call still asks by name.
@@ -128,7 +132,7 @@ def open_log(argv, logs=LOGS):
 
 def show(reply, d, ms):
     if d:
-        print(f"  [{d.route} · {d.intent} · {d.source} {d.score:.2f} · router {ms:.0f} ms]")
+        print(f"  [{d.route} · {d.intent} · {d.source or ''} {d.score:.2f} · router {ms:.0f} ms]")
     print(f"buddy> {reply}")
 
 
@@ -136,36 +140,41 @@ def show_cloud(live, action):
     if live and live.ms:
         print(f"  [live · {LIVE_MODEL} · " + " · ".join(f"{k} {v} ms" for k, v in live.ms.items()) + "]")
     if action:
-        print(f"  [cloud asked for {action[0]}({action[1]}); the phone confirms]")
+        print(f"  [cloud asked for {action.name}({action.args}); the phone confirms]")
 
 
 async def run_text(buddy, cloud, log):
     import pyaudio
 
-    out = pyaudio.PyAudio().open(format=pyaudio.paInt16, channels=1, rate=OUT_RATE, output=True)
+    audio = pyaudio.PyAudio()
+    out = audio.open(format=pyaudio.paInt16, channels=1, rate=OUT_RATE, output=True)
 
     async def play(chunk):
         await asyncio.to_thread(out.write, chunk)
 
-    while True:
-        try:
-            text = (await asyncio.to_thread(input, "you> ")).strip()
-        except EOFError:
-            return
-        log.write(text + "\n")  # the terminal echoes what the user types; the log needs it written
-        # The wake opens the session, so connecting and seeding overlap the "speech" below.
-        live = LiveTurn(buddy.log) if cloud == "live" and buddy.online else None
-        pcm = await asyncio.to_thread(say_pcm, text) if live else None
-        t0 = time.perf_counter()
-        reply = await asyncio.to_thread(buddy.handle, text)
-        ms = (time.perf_counter() - t0) * 1000
-        if reply is None:
-            reply, action, _ = await escalate(buddy.log, text, live, pcm, play)
-            reply = buddy.from_cloud(text, reply, action)
-            show_cloud(live, action)
-        elif live:
-            live.drop()
-        show(reply, buddy.last, ms)
+    try:
+        while True:
+            try:
+                text = (await asyncio.to_thread(input, "you> ")).strip()
+            except EOFError:
+                return
+            log.write(text + "\n")  # the terminal echoes what the user types; the log needs it written
+            # The wake opens the session, so connecting and seeding overlap the "speech" below.
+            live = LiveTurn(buddy.log) if cloud == "live" and buddy.online else None
+            pcm = await asyncio.to_thread(say_pcm, text) if live else None
+            t0 = time.perf_counter()
+            reply = await asyncio.to_thread(buddy.handle, text)
+            ms = (time.perf_counter() - t0) * 1000
+            if reply is None:
+                reply, action, _ = await escalate(buddy.log, text, live, pcm, play)
+                reply = buddy.from_cloud(text, reply, action)
+                show_cloud(live, action)
+            elif live:
+                live.drop()
+            show(reply, buddy.last, ms)
+    finally:
+        out.close()
+        audio.terminate()
 
 
 async def run_live(buddy, language, cloud, whisper, endpoint, audio_filter, snr, log):
@@ -228,16 +237,25 @@ async def run_live(buddy, language, cloud, whisper, endpoint, audio_filter, snr,
                 frame.audio = audio
             await self.push_frame(frame, direction)
 
+        async def cleanup(self):
+            await super().cleanup()
+            if self.started:
+                await self.filter.stop()
+
         def snr(self, t0, t1):
             """Measured SNR of the speech between t0 and t1 against the added noise, or None."""
             p = [x for t, x in self.levels if t0 <= t <= t1]
             if self.noise is None or not p:
                 return None
-            measured = 10 * np.log10(max(np.mean(p), 1.0) / self.noise_power)
-            # Voices and mic distances differ, so the noise follows the speaker: the next turn gets the target SNR.
+            return 10 * np.log10(max(np.mean(p), 1.0) / self.noise_power)
+
+        def track(self, measured):
+            """Voices and mic distances differ, so the noise follows the speaker: rescale it so that
+            the next turn gets the target SNR."""
+            if measured is None:
+                return
             gain = 10 ** ((measured - self.target) / 20)
             self.noise, self.noise_power = self.noise * gain, self.noise_power * gain ** 2
-            return measured
 
     class Whisper(WhisperSTTServiceMLX):
         """Pipecat's MLX Whisper with the contact-name prompt. It runs once per VAD segment, in order, and
@@ -250,12 +268,16 @@ async def run_live(buddy, language, cloud, whisper, endpoint, audio_filter, snr,
         async def run_stt(self, audio: bytes):
             import mlx_whisper
 
-            x = np.frombuffer(audio, np.int16).astype(np.float32) / 32768
-            r = await asyncio.to_thread(mlx_whisper.transcribe, x, path_or_hf_repo=self._settings.model,
-                                        temperature=0.0, language=self._settings.language,
-                                        initial_prompt=self.prompt)
-            text = " ".join(seg["text"].strip() for seg in r["segments"] if seg["no_speech_prob"] < 0.6).strip()
-            self.results.append(text)
+            # A failed segment still adds its "", so the results stay one per finished segment, in order.
+            text = ""
+            try:
+                x = np.frombuffer(audio, np.int16).astype(np.float32) / 32768
+                r = await asyncio.to_thread(mlx_whisper.transcribe, x, path_or_hf_repo=self._settings.model,
+                                            temperature=0.0, language=self._settings.language,
+                                            initial_prompt=self.prompt)
+                text = " ".join(seg["text"].strip() for seg in r["segments"] if seg["no_speech_prob"] < NO_SPEECH).strip()
+            finally:
+                self.results.append(text)
             if not text:
                 return
             logger.debug(f"Transcription: [{text}]")
@@ -266,27 +288,29 @@ async def run_live(buddy, language, cloud, whisper, endpoint, audio_filter, snr,
         buffered audio to the cloud. The turn strategy decides when the turn ends.
 
         A turn may hold several VAD segments. Whisper keeps one result per segment, and the turn joins
-        the results of its own segments."""
+        the results of its own segments. Turns reply one at a time, in order."""
 
-        def __init__(self, stop):
-            # No barge-in here. Whisper can take 5 s after a VAD stop, the default turn timeout.
+        def __init__(self, stop, buddy, cloud, mic, stt):
+            # No barge-in here. Whisper can take 5 s after a VAD stop, so the timeout is 10 s, not the 5 s default.
             super().__init__(user_turn_strategies=UserTurnStrategies(
                 start=[VADUserTurnStartStrategy(enable_interruptions=False)], stop=[stop]),
                 user_turn_stop_timeout=10)
+            self.buddy, self.cloud, self.mic, self.stt = buddy, cloud, mic, stt
             self.add_event_handler("on_user_turn_started", self.started)
             self.add_event_handler("on_user_turn_stopped", self.stopped)
             self.end_of_speech = self.turn_start = time.perf_counter()
             self.stops = self.first = 0  # VAD segments so far, and the first segment of this turn
-            self.preroll = b""  # VAD fires about 200 ms into speech, so keep the last 500 ms
+            self.preroll = b""  # the last PREROLL seconds of audio
             self.utterance = None  # audio of the current turn, from its buffered start
             self.speech_end = 0  # chunks of the utterance up to the last VAD stop
             self.live = None
+            self.lock = asyncio.Lock()  # one turn at a time, from the router to the end of its reply
 
         async def process_frame(self, frame: Frame, direction: FrameDirection):
             if isinstance(frame, InputAudioRawFrame):
                 if self.utterance is not None:
                     self.utterance.append(frame.audio)
-                self.preroll = (self.preroll + frame.audio)[-IN_RATE:]
+                self.preroll = (self.preroll + frame.audio)[-int(PREROLL * IN_RATE) * 2:]
             elif isinstance(frame, VADUserStoppedSpeakingFrame):
                 self.end_of_speech, self.speech_end = time.perf_counter(), len(self.utterance or [])
                 self.stops += 1
@@ -302,20 +326,21 @@ async def run_live(buddy, language, cloud, whisper, endpoint, audio_filter, snr,
             if self.live:
                 self.live.drop()
             # The wake: open and seed the cloud session while the user is still talking.
-            self.live = LiveTurn(buddy.log) if cloud == "live" and buddy.online else None
+            self.live = LiveTurn(self.buddy.log) if self.cloud == "live" and self.buddy.online else None
 
         async def stopped(self, _, strategy):
             # The strategy ends the turn on the first transcript after Smart Turn says "complete". After a
-            # pause, a later segment's transcript is still in Whisper, so wait for it (or give up after 5 s).
-            # A new turn can start while this one waits, so take this turn's state first.
+            # pause, a later segment's transcript is still in Whisper, so wait for it (or give up after
+            # TRANSCRIPT_WAIT). A new turn can start while this one waits, so take this turn's state first.
             first, last, end = self.first, self.stops, self.end_of_speech
-            snr = mic.snr(self.turn_start - 0.5, end)
+            snr = self.mic.snr(self.turn_start - PREROLL, end)
+            self.mic.track(snr)
             pcm, self.utterance = b"".join((self.utterance or [])[:self.speech_end]), None
             live, self.live = self.live, None
-            deadline = time.perf_counter() + 5
-            while len(stt.results) < last and time.perf_counter() < deadline:
+            deadline = time.perf_counter() + TRANSCRIPT_WAIT
+            while len(self.stt.results) < last and time.perf_counter() < deadline:
                 await asyncio.sleep(0.02)
-            text = " ".join(t for t in stt.results[first:last] if t)
+            text = " ".join(t for t in self.stt.results[first:last] if t)
             if not text:
                 if live:
                     live.drop()
@@ -326,36 +351,36 @@ async def run_live(buddy, language, cloud, whisper, endpoint, audio_filter, snr,
             await self.turn(text, pcm, live)
 
         async def turn(self, text, pcm, live):
-            now = time.perf_counter()
-            reply = await asyncio.to_thread(buddy.handle, text)
-            ms = (time.perf_counter() - now) * 1000
-            if reply is None:
-                reply, action, played = await escalate(buddy.log, text, live, pcm, self.play)
-                reply = buddy.from_cloud(text, reply, action)
-                show_cloud(live, action)
-                if played and not action:
-                    reply = None  # already heard in Gemini's voice
-            elif live:
-                live.drop()
-            show(reply or buddy.log[-1][1], buddy.last, ms)
-            await self.say(reply)
+            async with self.lock:  # the reply plays inside the lock, so no turn lifts another's mute
+                buddy, spoken = self.buddy, False
+                now = time.perf_counter()
+                reply = await asyncio.to_thread(buddy.handle, text)
+                ms = (time.perf_counter() - now) * 1000
+                if reply is None:
+                    reply, action, played = await escalate(buddy.log, text, live, pcm, self.play)
+                    reply = buddy.from_cloud(text, reply, action)
+                    show_cloud(live, action)
+                    spoken = played and not action  # already heard in Gemini's voice, or a dry-run note
+                elif live:
+                    live.drop()
+                show(reply, buddy.last, ms)
+                if not spoken:
+                    await self.say(reply)
 
         async def play(self, chunk):
             await self.push_frame(OutputAudioRawFrame(audio=chunk, sample_rate=OUT_RATE, num_channels=1))
-            start = max(time.perf_counter(), mic.until - 0.3)
-            mic.until = start + len(chunk) / (2 * OUT_RATE) + 0.3
+            start = max(time.perf_counter(), self.mic.until - MUTE_TAIL)
+            self.mic.until = start + len(chunk) / (2 * OUT_RATE) + MUTE_TAIL
 
         async def say(self, reply):
-            if not reply or reply.startswith("["):
+            if not reply:
                 return
-            mic.until = float("inf")
-            proc = await asyncio.create_subprocess_exec("say", "-v", voice(reply), reply)
-
-            async def done():
+            self.mic.until = float("inf")
+            try:
+                proc = await asyncio.create_subprocess_exec("say", "-v", voice(reply), reply)
                 await proc.wait()
-                mic.until = time.perf_counter() + 0.3
-
-            asyncio.create_task(done())
+            finally:
+                self.mic.until = time.perf_counter() + MUTE_TAIL
 
     transport = LocalAudioTransport(LocalAudioTransportParams(
         audio_in_enabled=True, audio_in_sample_rate=IN_RATE, audio_out_enabled=True, audio_out_sample_rate=OUT_RATE))
@@ -368,7 +393,8 @@ async def run_live(buddy, language, cloud, whisper, endpoint, audio_filter, snr,
         model=whisper, language=Language(language) if language else None))
     import mlx_whisper
     mlx_whisper.transcribe(np.zeros(IN_RATE, np.float32), path_or_hf_repo=whisper)  # the first call is about 5 s slower
-    pipeline = Pipeline([transport.input(), mic, vad, stt, BuddyProcessor(stop), transport.output()])
+    pipeline = Pipeline([transport.input(), mic, vad, stt, BuddyProcessor(stop, buddy, cloud, mic, stt),
+                         transport.output()])
     extras = [x for x, on in [("RNNoise", audio_filter), (f"pink noise at about {snr} dB SNR", snr is not None)] if on]
     print(f"Listening{' with ' + ' and '.join(extras) if extras else ''}. The mic is muted while Buddy speaks. "
           f"Log: {os.path.relpath(log.name)}")

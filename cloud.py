@@ -8,6 +8,7 @@
 import asyncio
 import os
 import time
+from typing import NamedTuple
 
 from google import genai
 from google.genai import types
@@ -18,6 +19,7 @@ SYSTEM = ("You are Buddy, the voice assistant on a pair of smart glasses. Reply 
           "spoken sentences, in the language the user spoke. Earlier turns may have been answered on "
           "the phone; treat them as your own.")
 IN_RATE, OUT_RATE = 16000, 24000
+LIVE_TIMEOUT = 15  # seconds to wait for each Live message before the text cascade takes over
 # The cloud may ask for these, but the phone always confirms first, so a cloud mistake never acts alone.
 TOOLS = [types.Tool(function_declarations=[
     types.FunctionDeclaration(
@@ -28,12 +30,18 @@ TOOLS = [types.Tool(function_declarations=[
 ])]
 
 
+class ToolCall(NamedTuple):
+    """A tool call the cloud asked for. The phone confirms it before anything runs."""
+    name: str
+    args: dict
+
+
 def api_key():
     return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 
 def contents(log):
-    return [types.Content(role=r, parts=[types.Part(text=t)]) for r, t in log]
+    return [types.Content(role=r, parts=[types.Part(text=t)]) for r, t in log if t]
 
 
 def ask_text(log, text):
@@ -45,7 +53,7 @@ def ask_text(log, text):
         config=types.GenerateContentConfig(system_instruction=SYSTEM, tools=TOOLS))
     if resp.function_calls:
         fc = resp.function_calls[0]
-        return "", (fc.name, dict(fc.args or {}))
+        return "", ToolCall(fc.name, dict(fc.args or {}))
     return (resp.text or "").strip(), None
 
 
@@ -99,7 +107,7 @@ class LiveTurn:
                 async for msg in s.receive():
                     if msg.tool_call and msg.tool_call.function_calls:
                         fc = msg.tool_call.function_calls[0]
-                        self.action = (fc.name, dict(fc.args or {}))
+                        self.action = ToolCall(fc.name, dict(fc.args or {}))
                         break  # the session ends here; the phone asks the user itself
                     if msg.data:
                         self._mark("first_audio", self._t_escalate)
@@ -121,16 +129,20 @@ class LiveTurn:
 async def escalate(log, text, live, pcm, play):
     """Answer a cloud turn, playing Live audio through `play`.
 
-    Returns (reply, action, played): the reply text for the log, a requested tool call or None,
-    and whether the user has already heard the reply."""
+    Returns (reply, action, played): the reply text for the log, a ToolCall or None, and whether
+    the reply needs no speech, because the user has already heard it or it is a dry-run note."""
     if live:
         live.escalate(pcm)
         played = False
-        while (chunk := await live.out.get()) is not None:
-            await play(chunk)
-            played = True
+        try:
+            while (chunk := await asyncio.wait_for(live.out.get(), LIVE_TIMEOUT)) is not None:
+                await play(chunk)
+                played = True
+        except TimeoutError:
+            live.drop()  # cancelling the task closes the session
+            live.error = TimeoutError(f"no Live output for {LIVE_TIMEOUT} s")
         if not live.error:
             return live.transcript.strip(), live.action, played
         print(f"  [live failed: {live.error!r}; falling back to the text cascade]")
     reply, action = await asyncio.to_thread(ask_text, log, text)
-    return reply, action, False
+    return reply, action, not api_key()  # the dry run's note is shown, never spoken

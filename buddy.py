@@ -4,8 +4,9 @@ import logging
 import re
 import time
 from datetime import datetime
+from typing import NamedTuple
 
-from router import Router, normalise, resolve_contact
+from router import Route, Router, normalise, resolve_contact
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +28,13 @@ REPLY = {
 }
 
 
+class Pending(NamedTuple):
+    """An action Buddy has asked about once, waiting for yes or no."""
+    intent: str
+    contact: str | None
+    lang: str
+
+
 def lang_of(text):
     if re.search(r"[ऀ-ॿ]", text):
         return "hi"
@@ -44,10 +52,9 @@ def initiate_call(name):
 class Buddy:
     def __init__(self, router=None, online=True, now=datetime.now):
         self.router = router or Router()
-        self.router.probs(["warm up"])  # the first encode is slow
         self.online, self.now = online, now
         self.log = []  # (role, text): the phone's one text log, for both tiers
-        self.pending: dict | None = None  # asked once, waiting for yes or no
+        self.pending: Pending | None = None
         self.last = None  # Decision of the last turn, for logging
 
     def handle(self, text):
@@ -57,29 +64,31 @@ class Buddy:
         reply = self._confirm(text) if self.pending else None
         if reply is None:
             reply = self._route(text, lang)
-        if reply is not None:
+        if reply:  # an ignored turn ("") leaves no trace
             self.remember(text, reply)
         return reply
 
     def remember(self, text, reply):
-        self.log += [("user", text), ("model", reply)]
+        """Log a turn. An empty reply (Live audio with no transcript) logs the user's words only."""
+        self.log += [("user", text)] + ([("model", reply)] if reply else [])
 
     def from_cloud(self, text, reply, action):
-        """Record a cloud turn. A tool call from the cloud never runs directly; the phone asks first."""
+        """Record a cloud turn. `action` is a cloud.ToolCall or None. A tool call from the cloud
+        never runs directly; the phone asks first."""
         lang = lang_of(text)
-        if action and action[0] == "initiate_call":
-            contact = resolve_contact(action[1].get("name", ""))
+        if action and action.name == "initiate_call":
+            contact = resolve_contact(action.args.get("name", ""))
             reply = self._ask("call_contact", contact, lang) if contact else REPLY["no_name"][lang]
-        elif action and action[0] == "take_photo":
+        elif action and action.name == "take_photo":
             reply = self._ask("take_photo", None, lang)
         elif action:  # schema check: an unknown tool name never runs
-            log.warning("cloud asked for unknown tool %r; rejected", action[0])
+            log.warning("cloud asked for unknown tool %r; rejected", action.name)
             reply = REPLY["unknown_tool"][lang]
         self.remember(text, reply)
         return reply
 
     def _ask(self, intent, contact, lang):
-        self.pending = {"intent": intent, "contact": contact, "lang": lang}
+        self.pending = Pending(intent, contact, lang)
         if intent == "call_contact":
             return REPLY["call_ask"][lang].format(name=contact)
         return REPLY["photo_ask"][lang]
@@ -93,27 +102,27 @@ class Buddy:
 
     def _confirm(self, text):
         words = set(normalise(text, fillers=()).split())
-        pending, self.pending = self.pending or {}, None  # Buddy asks once only
+        pending, self.pending = self.pending, None  # Buddy asks once only
         if words & YES:
-            return self._run(pending["intent"], pending["contact"], pending["lang"])
+            return self._run(pending.intent, pending.contact, pending.lang)
         if words & NO:
-            return REPLY["cancelled"][pending["lang"]]
+            return REPLY["cancelled"][pending.lang]
         return None  # anything else is a new turn
 
     def _route(self, text, lang):
         d = self.last = self.router.decide(text, online=self.online)
-        if d.route == "ignore":
+        if d.route == Route.IGNORE:
             return ""
-        if d.route == "offline":
+        if d.route == Route.OFFLINE:
             return REPLY["offline"][lang]
-        if d.route == "cloud":
+        if d.route == Route.CLOUD:
             return None
         if d.intent == "call_contact":  # calls always ask by name, so a wrong guess is caught
             contact = d.contact or self.recent_contact()
             if not contact:
                 return REPLY["no_name"][lang]
             return self._ask(d.intent, contact, lang)
-        if d.route == "ask":
+        if d.route == Route.ASK:
             return self._ask(d.intent, None, lang)
         return self._run(d.intent, d.contact, lang)
 

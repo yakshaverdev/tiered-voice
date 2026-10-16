@@ -4,6 +4,7 @@ import difflib
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from enum import StrEnum, auto
 from pathlib import Path
 
 import joblib
@@ -70,12 +71,26 @@ def mask_names(norm):
     return " ".join("someone" if w in EXACT_NAMES else w for w in norm.split())
 
 
+class Route(StrEnum):
+    LOCAL = auto()
+    ASK = auto()
+    CLOUD = auto()
+    OFFLINE = auto()
+    IGNORE = auto()
+
+
+class Source(StrEnum):
+    GRAMMAR = auto()
+    CLASSIFIER = auto()
+    BANNED = auto()
+
+
 @dataclass
 class Decision:
-    route: str  # local | ask | cloud | offline | ignore
+    route: Route
     intent: str = "other"
     score: float = 0.0
-    source: str = ""  # grammar | classifier
+    source: Source | None = None  # None for an empty turn
     contact: str | None = None
     probs: dict = field(default_factory=dict)
 
@@ -105,6 +120,7 @@ class Router:
         saved = joblib.load(path)
         self.clf, self.temperature = saved["clf"], saved["temperature"]
         self.embedder = SentenceTransformer(EMBEDDER, device="cpu")
+        self.probs(["warm up"])  # the first encode is slow
 
     def probs(self, texts):
         """Calibrated probabilities, columns in INTENTS order."""
@@ -117,35 +133,36 @@ class Router:
 
     def decide(self, text, online=True, p=None):
         norm = normalise(text)
+        away = Route.CLOUD if online else Route.OFFLINE
         if not norm:
-            return Decision("ignore")
+            return Decision(Route.IGNORE)
         if norm in GRAMMAR:
-            return self._local(GRAMMAR[norm], 1.0, "grammar", text)
+            return self._local(GRAMMAR[norm], 1.0, Source.GRAMMAR, text)
         if banned(norm):
-            return Decision("cloud" if online else "offline", "other", 1.0, "banned")
+            return Decision(away, "other", 1.0, Source.BANNED)
         p = self.probs([text])[0] if p is None else p
         probs = dict(zip(INTENTS, p.round(3).tolist()))
         intent = INTENTS[int(p.argmax())]
         score = float(p.max())
         if intent == "other" or score < FLOOR:
-            return Decision("cloud" if online else "offline", "other", score, "classifier", probs=probs)
+            return Decision(away, "other", score, Source.CLASSIFIER, probs=probs)
         # Above 0.95 a calibrated score already implies a clear gap to the runner-up.
         if score >= THRESHOLD[intent]:
-            d = self._local(intent, score, "classifier", text)
+            d = self._local(intent, score, Source.CLASSIFIER, text)
         elif online:
-            d = Decision("cloud", intent, score, "classifier")
+            d = Decision(Route.CLOUD, intent, score, Source.CLASSIFIER)
         elif intent in SENSITIVE:
             contact = resolve_contact(text) if intent == "call_contact" else None
-            d = Decision("ask", intent, score, "classifier", contact)
+            d = Decision(Route.ASK, intent, score, Source.CLASSIFIER, contact)
         else:
-            d = self._local(intent, score, "classifier", text)
+            d = self._local(intent, score, Source.CLASSIFIER, text)
         d.probs = probs
         return d
 
     @staticmethod
     def _local(intent, score, source, text):
         contact = resolve_contact(text) if intent == "call_contact" else None
-        return Decision("local", intent, score, source, contact)
+        return Decision(Route.LOCAL, intent, score, source, contact)
 
 
 def train(rows, path=MODEL_PATH):

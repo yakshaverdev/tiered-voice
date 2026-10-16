@@ -56,7 +56,7 @@ async def turn(buddy, text, cloud, timings):
     reply, action, _ = await escalate(buddy.log, text, live, pcm, nothing)
     timings.append(live.ms if live else {"done": round((time.perf_counter() - t0) * 1000)})
     reply = buddy.from_cloud(text, reply, action)
-    return reply + (f"  (cloud asked for {action[0]})" if action else ""), "cloud"
+    return reply + (f"  (cloud asked for {action.name})" if action else ""), "cloud"
 
 
 async def run(router, cloud):
