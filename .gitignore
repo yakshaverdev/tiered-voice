@@ -8,5 +8,3 @@ logs/
 *.log
 # eval.py --audio writes one generated clip per test sentence
 results/audio/
-# uv run eval.py trains it
-models/

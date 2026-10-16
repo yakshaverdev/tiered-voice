@@ -1,12 +1,9 @@
 """Buddy's phone tier, with the laptop microphone standing in for the glass.
 
-    uv run app.py                    # mic -> Silero VAD -> Whisper (MLX) -> router -> tool or cloud
-    uv run app.py --cloud live       # cloud turns go to Gemini Live as the user's own audio
-    uv run app.py --text             # type turns; with --cloud live each is spoken by `say` first
-    uv run app.py --offline          # no cloud: gray-zone sensitive turns ask once, the rest refuse
-    uv run app.py --endpoint fixed   # one fixed 400 ms endpoint in place of Smart Turn v3
-    uv run app.py --denoise          # RNNoise on the mic input, before VAD, Smart Turn, Whisper and the cloud
-    uv run app.py --noise 10         # mix pink noise into the mic at about 10 dB SNR (combine with --denoise)
+    uv run app.py --language en      # mic -> RNNoise -> Silero VAD -> Whisper (MLX) -> router -> tool or cloud
+    uv run app.py --language hi --noise 10   # with pink noise mixed into the mic at about 10 dB SNR
+
+The cloud is Gemini Live when GEMINI_API_KEY is set. `--help` lists the options for experiments.
 
 Every run also writes logs/run-YYYYmmdd-HHMMSS.log (and logs/latest.log): the turns and Pipecat's DEBUG lines.
 """
@@ -384,18 +381,20 @@ async def run_live(buddy, language, cloud, whisper, endpoint, audio_filter, snr,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--text", action="store_true", help="type turns instead of using the microphone")
-    ap.add_argument("--cloud", choices=["text", "live"], default="text",
-                    help="text: Gemini text cascade; live: Gemini Live native audio")
+    ap.add_argument("--cloud", choices=["text", "live"], default=None,
+                    help="live (the default with GEMINI_API_KEY): Gemini Live native audio; text: Gemini text cascade")
     ap.add_argument("--offline", action="store_true", help="no cloud model")
     ap.add_argument("--language", default=None, help="fix Whisper's language (en or hi); default detects")
     ap.add_argument("--endpoint", choices=VAD_STOP, default="smart",
                     help="smart: Silero VAD with Smart Turn v3 and a 600 ms maximum wait; fixed: one 400 ms wait")
     ap.add_argument("--whisper", choices=WHISPER, default="turbo",
                     help="turbo is what eval.py measures; small is about 5x faster on a laptop, weaker in Hindi")
-    ap.add_argument("--denoise", action="store_true", help="RNNoise on the microphone input (live mode only)")
+    ap.add_argument("--denoise", action=argparse.BooleanOptionalAction, default=True,
+                    help="RNNoise on the microphone input (live mode only)")
     ap.add_argument("--noise", type=float, default=None, metavar="SNR_DB",
                     help="mix pink noise into the microphone at about this SNR in dB (live mode only)")
     args = ap.parse_args()
+    args.cloud = args.cloud or ("live" if api_key() else "text")
     if args.cloud == "live" and not api_key():
         sys.exit("--cloud live needs GEMINI_API_KEY")
     log = open_log(["app.py", *sys.argv[1:]])

@@ -14,34 +14,21 @@ You need macOS on Apple Silicon (Whisper runs on MLX, and replies use the `say` 
 
 ```sh
 uv sync
-uv run eval.py   # trains the router into models/router.joblib (about a minute); app.py and the tests need it
+export GEMINI_API_KEY=...   # in your shell, never in a file here
 ```
 
-The first speech run downloads Whisper large-v3-turbo (about 1.6 GB). The router downloads a multilingual MiniLM model (about 0.5 GB) the first time it trains.
-
-For the cloud tier, export `GEMINI_API_KEY` in your shell. Do not put it in a file in this folder. `GEMINI_LIVE_MODEL` and `GEMINI_MODEL` select the models. Without a key, a text cloud turn prints what it would send, and `--cloud live` and `handoff.py` refuse to start.
+The first run downloads Whisper large-v3-turbo (about 1.6 GB) and a multilingual MiniLM model for the router (about 0.5 GB).
 
 ## Run it
 
-| Scenario | Command |
-|:--|:--|
-| Typed turns, no microphone | `uv run app.py --text` |
-| Typed turns, cloud in Gemini Live (`say` speaks each turn) | `uv run app.py --text --cloud live` |
-| Speak, local turns only | `uv run app.py --offline` |
-| Speak, cloud as a text cascaded pipeline | `uv run app.py --cloud text` |
-| Speak, cloud in Gemini Live | `uv run app.py --cloud live` |
-| Speak with pink noise at about 10 dB SNR | `uv run app.py --noise 10` |
-| Same noise, with RNNoise on the input | `uv run app.py --noise 10 --denoise` |
-| Faster ASR for a demo, language fixed | `uv run app.py --whisper small --language en` (or `hi`) |
-| Fixed 400 ms endpoint in place of Smart Turn v3 | `uv run app.py --endpoint fixed` |
-| Router eval on typed text | `uv run eval.py` |
-| Router eval on synthetic noisy speech too (about an hour) | `uv run eval.py --audio` |
-| Hand-off between tiers, both cloud modes (needs a key) | `uv run handoff.py` |
-| Tests | `uv run pytest -q` |
+```sh
+uv run app.py --language en               # or hi
+uv run app.py --language en --noise 10    # pink noise in the mic at about 10 dB SNR
+```
 
-`--noise` starts against a typical speech level. After the first turn, it follows the speaker's measured level, so later turns get the SNR you asked for.
+With `GEMINI_API_KEY` set, the cloud tier is Gemini Live. Without it, cloud turns only print what they would send. RNNoise cleans the mic input in both commands. `uv run app.py --help` lists the other options.
 
-Wait for Buddy to finish speaking before you talk. There is no echo cancellation and no barge-in, so the microphone is muted while Buddy speaks.
+Wait for Buddy to finish speaking before you talk. There is no echo cancellation, so the microphone is muted while Buddy speaks.
 
 Latency here does not represent a phone. Whisper large-v3-turbo runs after the end of speech and takes about 3 s per turn on a laptop. A phone build would use streaming ASR.
 

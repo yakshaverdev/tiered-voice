@@ -45,7 +45,7 @@ def wer(pairs):
 def wer_scored(r):
     """Hinglish is written in Latin script, and Whisper with language hi writes Devanagari, so its WER would
     count the script. WER covers English and Devanagari Hindi only."""
-    return r["lang"] == "en" or not LATIN.search(r["spoken"])
+    return r["lang"] == "en" or not LATIN.search(r.get("spoken", r["text"]))
 
 
 def near_misses(rows, preds):
