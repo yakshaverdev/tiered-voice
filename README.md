@@ -48,8 +48,10 @@ The first line gives the transcript, the time from the VAD stop to the transcrip
 
 ## Eval
 
-`eval.py` tests the router on 262 sentences that it never saw in training, in English, Hindi and Hinglish. With `--audio`, it also speaks them with macOS voices, adds pink noise, and runs Whisper on the audio. Full results are in [`results/eval.md`](results/eval.md). The speech results there were measured without RNNoise.
+`eval.py` tests the router on 262 sentences that it never saw in training, in English, Hindi and Hinglish. With `--audio`, it also speaks them with macOS voices, adds pink noise at three levels (office 25 dB, street 15 dB and auto-rickshaw 5 dB SNR), and runs Whisper on the raw audio and after RNNoise. Full results are in [`results/eval.md`](results/eval.md).
 
 - On typed text, call recall is 70% in English and 88% in Hindi. 2 of 79 English photo or call actions that ran locally were wrong, and 0 of 76 in Hindi.
-- On clean synthetic speech, call recall is 46% in English and 54% in Hindi. With pink noise at 10 dB SNR, it is 39% and 44%. Wrong local actions stay rare, because an unsure command goes to the cloud.
-- The sets are too small to show a 99.5% target for sensitive actions. That needs about 600 clean decisions per language. All voices are synthetic, so the results say little about real users.
+- On clean synthetic speech, call recall is 46% in English and 54% in Hindi. On raw audio with street noise, it is 41% and 51%. With auto-rickshaw noise, it is 26% and 24%.
+- RNNoise before Whisper raised the word error rate in every noisy profile, by 17% to 58%. It helped a little only on clean English. It did not add wrong local actions.
+- Wrong local actions stay rare, because an unsure command goes to the cloud.
+- The sets are too small to show a 99.5% target for sensitive actions. That needs about 600 clean decisions per language. All voices and all noise are synthetic, so the results say little about real users.
